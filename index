@@ -1,0 +1,355 @@
+// ════════════════════════════════════════════════════════════════════════════════
+// CONFIGURAÇÃO
+// ════════════════════════════════════════════════════════════════════════════════
+
+const TOKEN_PADRAO = "COLE O TOKEN DA SESSÃO";
+
+const API_BASE = "https://api-monitor.beedelivery.com.br/api/deliverymen";
+
+const COLUNA_ID       = 1;  // Coluna A
+const LINHA_CABECALHO = 1;
+
+const CAMPOS = {
+  "NOME":             { endpoint: "",          path: ["data", "name"] },
+  "BAIRRO":           { endpoint: "",          path: ["data", "address", "neighborhood"] },
+  "CIDADE":           { endpoint: "",          path: ["data", "address", "city"] },
+  "COMPARTIMENTO":    { endpoint: "",          path: ["data", "compartment"] },
+  "VEICULO":          { endpoint: "/vehicles", path: ["data", 0, "type"] },
+  "DATA DE ATIVAÇÃO": { especial: "data_atual" },
+  "HORA":             { especial: "hora_atual" },   // ← NOVO
+};
+
+
+// ════════════════════════════════════════════════════════════════════════════════
+// GERENCIAMENTO DO TOKEN
+// ════════════════════════════════════════════════════════════════════════════════
+
+function getToken() {
+  const token = PropertiesService.getScriptProperties().getProperty("AUTH_TOKEN");
+  return token || TOKEN_PADRAO;
+}
+
+function setToken(novoToken) {
+  PropertiesService.getScriptProperties().setProperty("AUTH_TOKEN", novoToken);
+}
+
+function abrirJanelaToken() {
+  const tokenAtual = getToken();
+
+  const preview = tokenAtual.length > 20
+    ? tokenAtual.substring(0, 15) + "..." + tokenAtual.substring(tokenAtual.length - 8)
+    : tokenAtual;
+
+  const html = HtmlService.createHtmlOutput(`
+    <style>
+      body { font-family: Arial, sans-serif; padding: 16px; margin: 0; }
+      h3 { margin-top: 0; color: #333; }
+      .preview { background: #f4f4f4; padding: 8px; border-radius: 4px; font-family: monospace; font-size: 12px; margin-bottom: 12px; word-break: break-all; }
+      label { display: block; margin-bottom: 6px; font-weight: bold; color: #555; }
+      textarea { width: 100%; height: 80px; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 12px; box-sizing: border-box; resize: vertical; }
+      .hint { font-size: 11px; color: #888; margin-top: 4px; }
+      .btns { margin-top: 16px; text-align: right; }
+      button { padding: 8px 16px; margin-left: 8px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+      .salvar { background: #1a73e8; color: white; }
+      .salvar:hover { background: #1557b0; }
+      .cancelar { background: #e0e0e0; color: #333; }
+      .cancelar:hover { background: #ccc; }
+      .status { margin-top: 10px; padding: 8px; border-radius: 4px; display: none; font-size: 13px; }
+      .status.ok { background: #d4edda; color: #155724; display: block; }
+      .status.erro { background: #f8d7da; color: #721c24; display: block; }
+    </style>
+
+    <h3>🔑 Atualizar Token de Autenticação</h3>
+
+    <label>Token atual:</label>
+    <div class="preview">${preview}</div>
+
+    <label for="novoToken">Novo token:</label>
+    <textarea id="novoToken" placeholder="Cole o novo token aqui (ex: Bearer 1234567|abcdef...)"></textarea>
+    <div class="hint">Inclua o prefixo "Bearer " no início.</div>
+
+    <div id="status" class="status"></div>
+
+    <div class="btns">
+      <button class="cancelar" onclick="google.script.host.close()">Cancelar</button>
+      <button class="salvar" onclick="salvar()">Salvar</button>
+    </div>
+
+    <script>
+      function salvar() {
+        const novo = document.getElementById("novoToken").value.trim();
+        const status = document.getElementById("status");
+
+        if (!novo) {
+          status.className = "status erro";
+          status.textContent = "❌ Digite um token válido.";
+          return;
+        }
+
+        if (!novo.toLowerCase().startsWith("bearer ")) {
+          status.className = "status erro";
+          status.textContent = "❌ O token deve começar com 'Bearer '.";
+          return;
+        }
+
+        status.className = "status";
+        status.textContent = "Salvando...";
+        status.style.display = "block";
+
+        google.script.run
+          .withSuccessHandler(() => {
+            status.className = "status ok";
+            status.textContent = "✅ Token atualizado com sucesso!";
+            setTimeout(() => google.script.host.close(), 1200);
+          })
+          .withFailureHandler((err) => {
+            status.className = "status erro";
+            status.textContent = "❌ Erro: " + err.message;
+          })
+          .setToken(novo);
+      }
+    </script>
+  `)
+  .setWidth(450)
+  .setHeight(380);
+
+  SpreadsheetApp.getUi().showModalDialog(html, "Configurar Token");
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════════
+// GATILHO — Preenche automaticamente ao digitar ID na coluna A
+// ════════════════════════════════════════════════════════════════════════════════
+
+function aoEditarID(e) {
+  const sheet = e.range.getSheet();
+  const col   = e.range.getColumn();
+  const row   = e.range.getRow();
+  const valor = e.range.getValue();
+
+  if (col !== COLUNA_ID || row <= LINHA_CABECALHO) return;
+
+  if (!valor || String(valor).trim() === "") {
+    limparLinha(sheet, row);
+    return;
+  }
+
+  buscarEPreencherLinha(sheet, row, String(valor).trim());
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════════
+// BUSCA E PREENCHIMENTO
+// ════════════════════════════════════════════════════════════════════════════════
+
+function buscarEPreencherLinha(sheet, row, entregadorId) {
+  const cabecalhos = getCabecalhos(sheet);
+
+  // Marca células como "Buscando..." — exceto campos especiais já preenchidos
+  cabecalhos.forEach((cab, i) => {
+    const config = CAMPOS[cab];
+    if (!config) return;
+
+    // ← Proteção unificada para todos os campos especiais
+    if (config.especial === "data_atual" || config.especial === "hora_atual") {
+      const valorAtual = sheet.getRange(row, COLUNA_ID + 1 + i).getValue();
+      if (valorAtual !== "") return;
+    }
+
+    sheet.getRange(row, COLUNA_ID + 1 + i).setValue("⏳ Buscando...");
+  });
+  SpreadsheetApp.flush();
+
+  // Endpoints necessários (ignora campos especiais)
+  const endpointsNecessarios = [...new Set(
+    Object.values(CAMPOS)
+      .filter(c => !c.especial)
+      .map(c => c.endpoint)
+  )];
+
+  const respostas = {};
+  for (const ep of endpointsNecessarios) {
+    respostas[ep] = chamarAPI(entregadorId, ep);
+  }
+
+  for (const ep of endpointsNecessarios) {
+    if (respostas[ep].erro) {
+      sheet.getRange(row, COLUNA_ID + 1).setValue("❌ " + respostas[ep].erro);
+      cabecalhos.forEach((cab, i) => {
+        if (i > 0 && CAMPOS[cab]) sheet.getRange(row, COLUNA_ID + 1 + i).setValue("");
+      });
+      return;
+    }
+  }
+
+  const tz   = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const agora = new Date();
+
+  cabecalhos.forEach((cab, i) => {
+    const config = CAMPOS[cab];
+    if (!config) return;
+
+    const celula     = sheet.getRange(row, COLUNA_ID + 1 + i);
+    const valorAtual = celula.getValue();
+
+    // ── Campo especial: data (só preenche se estiver vazia) ──────────────────
+    if (config.especial === "data_atual") {
+      if (valorAtual === "" || valorAtual === "⏳ Buscando...") {
+        celula.setValue(Utilities.formatDate(agora, tz, "dd/MM/yyyy"));
+      }
+      return;
+    }
+
+    // ── Campo especial: hora (só preenche se estiver vazia) ──────────────────
+    if (config.especial === "hora_atual") {
+      if (valorAtual === "" || valorAtual === "⏳ Buscando...") {
+        celula.setValue(Utilities.formatDate(agora, tz, "dd/MM"));
+      }
+      return;
+    }
+
+    // ── Campos normais vindos da API ─────────────────────────────────────────
+    const json  = respostas[config.endpoint].dados;
+    const valor = extrairCampo(json, config.path);
+
+    celula.setValue(valor ? String(valor).toUpperCase() : "—");
+  });
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════════
+// CHAMADA À API
+// ════════════════════════════════════════════════════════════════════════════════
+
+function chamarAPI(entregadorId, endpoint) {
+  const url = `${API_BASE}/${entregadorId}${endpoint}`;
+
+  const options = {
+    method: "get",
+    headers: {
+      "Authorization":   getToken(),
+      "Accept":          "application/json",
+      "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0",
+      "Accept-Language": "pt-BR,pt;q=0.9",
+      "Referer":         "https://monitor.beedelivery.com.br/",
+    },
+    muteHttpExceptions: true,
+    followRedirects: false,
+  };
+
+  let resp;
+  try {
+    resp = UrlFetchApp.fetch(url, options);
+  } catch (err) {
+    return { erro: "Falha na requisição: " + err.message };
+  }
+
+  const status = resp.getResponseCode();
+  if (status === 401 || status === 403) return { erro: "Token expirado — atualize o token pelo menu 🚀 Entregadores." };
+  if (status === 404)                   return { erro: "Entregador não encontrado." };
+  if (status !== 200)                   return { erro: `Erro HTTP ${status}` };
+
+  try {
+    return { dados: JSON.parse(resp.getContentText()) };
+  } catch (e) {
+    return { erro: "Resposta inesperada da API." };
+  }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════════
+// UTILITÁRIOS
+// ════════════════════════════════════════════════════════════════════════════════
+
+function extrairCampo(obj, path) {
+  try {
+    return path.reduce((acc, key) => acc[key], obj);
+  } catch {
+    return null;
+  }
+}
+
+function getCabecalhos(sheet) {
+  const lastCol = sheet.getLastColumn();
+  if (lastCol < COLUNA_ID + 1) return [];
+  return sheet.getRange(LINHA_CABECALHO, COLUNA_ID + 1, 1, lastCol - COLUNA_ID)
+              .getValues()[0].map(String);
+}
+
+function limparLinha(sheet, row) {
+  const lastCol = sheet.getLastColumn();
+  if (lastCol <= COLUNA_ID) return;
+  sheet.getRange(row, COLUNA_ID + 1, 1, lastCol - COLUNA_ID).clearContent();
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════════
+// MENU
+// ════════════════════════════════════════════════════════════════════════════════
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("🚀 Entregadores")
+    .addItem("Buscar todos os IDs da planilha", "buscarTodos")
+    .addSeparator()
+    .addItem("🔑 Atualizar Token", "abrirJanelaToken")
+    .addItem("🔍 Inspecionar JSON da API", "inspecionarAPI")
+    .addToUi();
+}
+
+function buscarTodos() {
+  const sheet   = SpreadsheetApp.getActiveSheet();
+  const lastRow = sheet.getLastRow();
+  let count = 0;
+
+  for (let row = LINHA_CABECALHO + 1; row <= lastRow; row++) {
+    const id = sheet.getRange(row, COLUNA_ID).getValue();
+    if (id && String(id).trim() !== "") {
+      buscarEPreencherLinha(sheet, row, String(id).trim());
+      count++;
+    }
+  }
+
+  SpreadsheetApp.getUi().alert(`✅ Concluído! ${count} entregador(es) buscados.`);
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════════
+// DEBUG
+// ════════════════════════════════════════════════════════════════════════════════
+
+function inspecionarAPI() {
+  const ID_TESTE = "1062418";
+
+  const principal = chamarAPI(ID_TESTE, "");
+  const veiculos  = chamarAPI(ID_TESTE, "/vehicles");
+
+  if (principal.erro) { Logger.log("ERRO principal: " + principal.erro); return; }
+  if (veiculos.erro)  { Logger.log("ERRO veículos: "  + veiculos.erro);  return; }
+
+  Logger.log("=== JSON PRINCIPAL ===");
+  Logger.log(JSON.stringify(principal.dados, null, 2));
+
+  Logger.log("\n=== JSON VEÍCULOS ===");
+  Logger.log(JSON.stringify(veiculos.dados, null, 1));
+
+  Logger.log("\n=== VALORES EXTRAÍDOS ===");
+  Logger.log("NOME:          " + extrairCampo(principal.dados, ["data", "name"]));
+  Logger.log("BAIRRO:        " + extrairCampo(principal.dados, ["data", "address", "neighborhood"]));
+  Logger.log("CIDADE:        " + extrairCampo(principal.dados, ["data", "address", "city"]));
+  Logger.log("COMPARTIMENTO: " + extrairCampo(principal.dados, ["data", "compartment"]));
+  Logger.log("VEICULO:       " + extrairCampo(veiculos.dados,  ["data", 0, "type"]));
+}
+
+function inspecionarAPIstatus() {
+  const ID_TESTE = "789946";
+
+  const principal = chamarAPI(ID_TESTE, "/status-records");
+  const veiculos  = chamarAPI(ID_TESTE, "/vehicles");
+
+  if (principal.erro) { Logger.log("ERRO principal: " + principal.erro); return; }
+  if (veiculos.erro)  { Logger.log("ERRO veículos: "  + veiculos.erro);  return; }
+
+  Logger.log("=== JSON PRINCIPAL ===");
+  Logger.log(JSON.stringify(principal.dados, null, 2));
+}
